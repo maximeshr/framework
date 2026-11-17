@@ -106,6 +106,102 @@ describe("a flat build resolves every plugin-root reference to a file it writes"
   });
 });
 
+/** Every path under the output root that a written file names for `leaf`, relative to it.
+ * Antigravity carries each command base64-encoded, so those are read decoded too. */
+function namedPaths(files: Map<string, string>, leaf: string): string[] {
+  const out = `${OUT.replace(/\\/g, "/")}/`;
+  const pattern = new RegExp(
+    `(?:${escapeRegExp(out)}|(?:\\./)+)([^"'\\s]*${escapeRegExp(leaf)})`,
+    "g"
+  );
+  return [...files.values()].flatMap((content) => {
+    const decoded = [...content.matchAll(/[A-Za-z0-9+/]{16,}={0,2}/g)].map((match) =>
+      Buffer.from(match[0], "base64").toString()
+    );
+    return [content, ...decoded].flatMap((text) =>
+      [...text.matchAll(pattern)].map((match) => match[1] ?? "")
+    );
+  });
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+describe("a flat build ships what a command names outside agents, skills and hooks", () => {
+  it.each(flatTools())("writes every such file %s's configs name", async (tool) => {
+    const fs = seeded(["scripts/x.js"]);
+
+    await build(tool, fs);
+
+    const files = written(fs);
+    const named = namedPaths(files, "scripts/x.js");
+    expect(named.length, "a config names the script").toBeGreaterThan(0);
+    expect(named.filter((path) => !files.has(path))).toEqual([]);
+  });
+
+  it.each(flatTools())("ships the named file's whole folder for %s", async (tool) => {
+    const fs = seeded(["scripts/x.js"]);
+    fs.setFile(`${PLUGIN_SRC}/scripts/lib/y.js`, "module.exports = 1;\n");
+
+    await build(tool, fs);
+
+    const files = written(fs);
+    const [script] = namedPaths(files, "scripts/x.js");
+    const sibling = script?.replace(/x\.js$/, "lib/y.js") ?? "";
+    expect(files.get(sibling)).toBe("module.exports = 1;\n");
+  });
+
+  it.each(flatTools())("ships no folder a command does not name for %s", async (tool) => {
+    const fs = seeded(["scripts/x.js"]);
+    fs.setFile(`${PLUGIN_SRC}/docs/notes.md`, "Notes.\n");
+
+    await build(tool, fs);
+
+    expect([...written(fs).keys()].filter((path) => path.endsWith("notes.md"))).toEqual([]);
+  });
+
+  it.each(flatTools())("ships nothing a command names above the plugin for %s", async (tool) => {
+    const fs = seeded(["../neighbour/secret.md"]);
+    fs.setFile(`${SOURCE}/plugins/neighbour/secret.md`, "Secret.\n");
+
+    await build(tool, fs);
+
+    expect([...written(fs).keys()].filter((path) => path.endsWith("secret.md"))).toEqual([]);
+  });
+
+  it.each(flatTools())("keeps two plugins' same-named files apart for %s", async (tool) => {
+    const fs = seeded(["scripts/x.js"]);
+    const other = `${SOURCE}/plugins/other`;
+    fs.setFile(`${other}/hooks/hooks.json`, fs.getFile(`${PLUGIN_SRC}/hooks/hooks.json`) ?? "");
+    fs.setFile(`${other}/.mcp.json`, fs.getFile(`${PLUGIN_SRC}/.mcp.json`) ?? "");
+    fs.setFile(`${other}/scripts/x.js`, "console.log('other');\n");
+    const contract = buildContractFor(tool, "flat");
+    if (contract === undefined) throw new Error(`${tool} has no flat contract`);
+    const strategy = new FlatBuildStrategy(fs, ASSETS, contract(), false, OUT, async () => true);
+
+    await strategy.preBuild(OUT, SOURCE);
+    for (const [name, src] of [
+      [PLUGIN, PLUGIN_SRC],
+      ["other", other],
+    ] as const) {
+      await strategy.writeHooks(name, src);
+      await strategy.writeMcp(name, src);
+    }
+    await strategy.postBuild(
+      { name: "m", plugins: [] },
+      [{ name: PLUGIN }, { name: "other" }],
+      OUT
+    );
+
+    const contents = [...written(fs)]
+      .filter(([path]) => path.endsWith("scripts/x.js"))
+      .map(([, content]) => content)
+      .sort();
+    expect(contents).toEqual(["console.log('other');\n", "console.log('x');\n"]);
+  });
+});
+
 describe("a flat build that folds MCP servers into the tool's own config", () => {
   it.each(["codex", "kilo", "opencode"] as const)(
     "names the plugin whose MCP config %s cannot parse",

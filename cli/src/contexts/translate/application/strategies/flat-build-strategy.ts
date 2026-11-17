@@ -33,6 +33,9 @@ function parsePluginMcp(pluginName: string, content: string): unknown {
 
 export class FlatBuildStrategy implements BuildOutputStrategy {
   private sourceDir = "";
+  /** Per plugin, the top-level entries a command names outside agents, skills and hooks: each
+   * is shipped whole once every reference to it is resolved. */
+  private readonly namedElsewhere = new Map<string, Set<string>>();
 
   constructor(
     private readonly fs: FileReader & FileWriter,
@@ -114,6 +117,14 @@ export class FlatBuildStrategy implements BuildOutputStrategy {
     builtPlugins: readonly { name: string }[],
     outDir: string
   ): Promise<number> {
+    const configCount = await this.writeConfigArtifact(builtPlugins, outDir);
+    return configCount + (await this.writeNamedElsewhere());
+  }
+
+  private async writeConfigArtifact(
+    builtPlugins: readonly { name: string }[],
+    outDir: string
+  ): Promise<number> {
     const step = this.contract.configArtifact;
     if (!step) return 0;
     const names = builtPlugins.map((p) => p.name);
@@ -131,6 +142,40 @@ export class FlatBuildStrategy implements BuildOutputStrategy {
     });
     for (const file of files) await this.fs.writeFile(join(outDir, file.path), file.content);
     return files.length;
+  }
+
+  /** Byte-for-byte as text, like a hook script: an entry's mode and binary content are not kept. */
+  private async writeNamedElsewhere(): Promise<number> {
+    const hooks = this.contract.artifacts.hooks;
+    if (!hooks.supported) return 0;
+    let count = 0;
+    for (const [pluginName, entries] of this.namedElsewhere) {
+      const pluginSrc = join(this.sourceDir, "plugins", pluginName);
+      for (const entry of entries) {
+        const entrySrc = join(pluginSrc, entry);
+        if (!(await this.fs.fileExists(entrySrc))) continue;
+        const files = (await this.isDirectory(entrySrc))
+          ? await this.fs.listFilesRecursive(entrySrc)
+          : [entrySrc];
+        for (const absPath of files) {
+          const pluginPath = relative(pluginSrc, absPath).replace(/\\/g, "/");
+          const destPath = join(this.absOut, this.flatPathElsewhere(hooks, pluginName, pluginPath));
+          await this.checkCollision(destPath, pluginName);
+          await this.fs.writeFile(destPath, await this.fs.readFile(absPath));
+          count++;
+        }
+      }
+    }
+    return count;
+  }
+
+  /** The one folder of its own every flat host already gives a plugin, and loads nothing from. */
+  private flatPathElsewhere(
+    hooks: Extract<ArtifactContract, { supported: true }>,
+    pluginName: string,
+    pluginPath: string
+  ): string {
+    return hooks.path(pluginName, `hooks/${pluginPath}`);
   }
 
   /** Each built plugin's `.mcp.json`, its plugin-root paths already resolved into the output, as
@@ -376,7 +421,11 @@ export class FlatBuildStrategy implements BuildOutputStrategy {
     if (suffix.startsWith("hooks/") && art.hooks.supported) {
       return art.hooks.path(pluginName, `hooks/${suffix.slice("hooks/".length)}`);
     }
-    return suffix;
+    const entry = suffix.split("/")[0] ?? "";
+    if (!art.hooks.supported || entry === "" || entry === "." || entry === "..") return suffix;
+    const named = this.namedElsewhere.get(pluginName) ?? new Set<string>();
+    this.namedElsewhere.set(pluginName, named.add(entry));
+    return this.flatPathElsewhere(art.hooks, pluginName, suffix);
   }
 
   private async checkCollision(destPath: string, pluginName: string): Promise<void> {
